@@ -17,9 +17,12 @@ Options:
   set an ssh option
 * -L, --print-build-logs
   print full build logs
+* --env-password
+  set a password used by ssh-copy-id, the password should be set by
+  the environment variable SSH_PASS
 * -s, --store-paths <disko-script> <nixos-system>
   set the store paths to the disko-script and nixos-system directly
-  if this is give, flake is not needed
+  if this is given, flake is not needed
 * --no-reboot
   do not reboot after installation, allowing further customization of the target installation.
 * --kexec <path>
@@ -59,6 +62,7 @@ step() {
   echo "### $* ###"
 }
 
+here=$(dirname "${BASH_SOURCE[0]}")
 kexec_url=""
 enable_debug=""
 maybe_reboot="sleep 6 && reboot"
@@ -161,6 +165,9 @@ while [[ $# -gt 0 ]]; do
     ;;
   --build-on-remote)
     build_on_remote=y
+    ;;
+  --env-password)
+    env_password=y
     ;;
   --vm-test)
     vm_test=y
@@ -282,48 +289,40 @@ if [[ -n ${ssh_private_key_file-} ]]; then
 fi
 
 ssh_settings=$(ssh "${ssh_args[@]}" -G "${ssh_connection}")
+ssh_user=$(echo "$ssh_settings" | awk '/^user / { print $2 }')
 ssh_host=$(echo "$ssh_settings" | awk '/^hostname / { print $2 }')
 ssh_port=$(echo "$ssh_settings" | awk '/^port / { print $2 }')
 
 step Uploading install SSH keys
 until
-  ssh-copy-id \
-    -i "$ssh_key_dir"/nixos-anywhere.pub \
-    -o ConnectTimeout=10 \
-    -o UserKnownHostsFile=/dev/null \
-    -o StrictHostKeyChecking=no \
-    "${ssh_copy_id_args[@]}" \
-    "${ssh_args[@]}" \
-    "$ssh_connection"
+  if [[ -n ${env_password-} ]]; then
+    sshpass -e \
+      ssh-copy-id \
+      -i "$ssh_key_dir"/nixos-anywhere.pub \
+      -o ConnectTimeout=10 \
+      -o UserKnownHostsFile=/dev/null \
+      -o IdentitiesOnly=yes \
+      -o StrictHostKeyChecking=no \
+      "${ssh_copy_id_args[@]}" \
+      "${ssh_args[@]}" \
+      "$ssh_connection"
+  else
+    ssh-copy-id \
+      -i "$ssh_key_dir"/nixos-anywhere.pub \
+      -o ConnectTimeout=10 \
+      -o UserKnownHostsFile=/dev/null \
+      -o StrictHostKeyChecking=no \
+      "${ssh_copy_id_args[@]}" \
+      "${ssh_args[@]}" \
+      "$ssh_connection"
+  fi
 do
   sleep 3
 done
 
 import_facts() {
   local facts filtered_facts
-  if ! facts=$(
-    ssh_ -o ConnectTimeout=10 sh -- <<SSH
-set -efu ${enable_debug}
-has(){
-  command -v "\$1" >/dev/null && echo "y" || echo "n"
-}
-is_nixos=\$(if test -f /etc/os-release && grep -q ID=nixos /etc/os-release; then echo "y"; else echo "n"; fi)
-cat <<FACTS
-is_os=\$(uname)
-is_arch=\$(uname -m)
-is_kexec=\$(if test -f /etc/is_kexec; then echo "y"; else echo "n"; fi)
-is_nixos=\$is_nixos
-is_installer=\$(if [[ "\$is_nixos" == "y" ]] && grep -q VARIANT_ID=installer /etc/os-release; then echo "y"; else echo "n"; fi)
-is_container=\$(if [[ "\$(has systemd-detect-virt)" == "y" ]]; then systemd-detect-virt --container; else echo "none"; fi)
-has_tar=\$(has tar)
-has_sudo=\$(has sudo)
-has_doas=\$(has doas)
-has_wget=\$(has wget)
-has_curl=\$(has curl)
-has_setsid=\$(has setsid)
-FACTS
-SSH
-  ); then
+  if ! facts=$(ssh_ -o ConnectTimeout=10 enable_debug=$enable_debug sh -- <"$here"/get-facts.sh); then
     exit 1
   fi
   filtered_facts=$(echo "$facts" | grep -E '^(has|is)_[a-z0-9_]+=\S+')
@@ -380,6 +379,11 @@ $maybe_sudo rm -rf /root/kexec
 $maybe_sudo mkdir -p /root/kexec
 SSH
 
+  # no way to reach global ipv4 destinations, use gh-v6.com automatically if github url
+  if [[ ${has_ipv6_only-n} == "y" ]] && [[ $kexec_url == "https://github.com/"* ]]; then
+    kexec_url=${kexec_url/"github.com"/"gh-v6.com"}
+  fi
+
   if [[ -f $kexec_url ]]; then
     ssh_ "${maybe_sudo} tar -C /root/kexec -xvzf-" <"$kexec_url"
   elif [[ ${has_curl-n} == "y" ]]; then
@@ -411,6 +415,14 @@ SSH
   # waiting for machine to become available again
   until ssh_ -o ConnectTimeout=10 -- exit 0; do sleep 5; done
 fi
+
+# Installation will fail if non-root user is used for installer.
+# Switch to root user by copying authorized_keys.
+if [[ ${is_installer-n} == "y" ]] && [[ ${ssh_user} != "root" ]]; then
+  ssh_ "${maybe_sudo} mkdir -p /root/.ssh; ${maybe_sudo} cp ~/.ssh/authorized_keys /root/.ssh"
+  ssh_connection="root@${ssh_host}"
+fi
+
 for path in "${!disk_encryption_keys[@]}"; do
   step "Uploading ${disk_encryption_keys[$path]} to $path"
   ssh_ "umask 077; cat > $path" <"${disk_encryption_keys[$path]}"
@@ -482,13 +494,13 @@ export PATH="\$PATH:/run/current-system/sw/bin"
 # needed for installation if initrd-secrets are used
 mkdir -p /mnt/tmp
 chmod 777 /mnt/tmp
-if [[ ${copy_host_keys-n} == "y" ]]; then
+if [ ${copy_host_keys-n} = "y" ]; then
   # NB we copy host keys that are in turn copied by kexec installer.
   mkdir -m 755 -p /mnt/etc/ssh
   for p in /etc/ssh/ssh_host_*; do
     # Skip if the source file does not exist (i.e. glob did not match any files)
     # or the destination already exists (e.g. copied with --extra-files).
-    if [ ! -e "\$p" -o -e "/mnt/\$p" ]; then
+    if [ ! -e "\$p" ] || [ -e "/mnt/\$p" ]; then
       continue
     fi
     cp -a "\$p" "/mnt/\$p"
